@@ -7,70 +7,48 @@ from google.oauth2 import service_account
 
 # ══ CONFIGURACIÓN ══
 PROJECT_ID = os.environ['FIREBASE_PROJECT_ID']
-VAPID_KEY  = os.environ['VAPID_KEY']
 SA_JSON    = os.environ['FIREBASE_SERVICE_ACCOUNT']
 
-# Zona horaria Colombia (UTC-5)
 COL_TZ = timezone(timedelta(hours=-5))
 
 def get_access_token():
-    """Obtener token de acceso para FCM V1"""
     sa_info = json.loads(SA_JSON)
     credentials = service_account.Credentials.from_service_account_info(
         sa_info,
-        scopes=['https://www.googleapis.com/auth/firebase.messaging']
+        scopes=[
+            'https://www.googleapis.com/auth/firebase.messaging',
+            'https://www.googleapis.com/auth/firebase.database',
+            'https://www.googleapis.com/auth/userinfo.email'
+        ]
     )
     request = google.auth.transport.requests.Request()
     credentials.refresh(request)
     return credentials.token
 
-def get_tokens_firebase(token_acceso):
-    """Obtener todos los tokens de dispositivos registrados"""
-    url = f"https://{PROJECT_ID}-default-rtdb.firebaseio.com/tokens.json"
-    headers = {"Authorization": f"Bearer {token_acceso}"}
-    resp = requests.get(url, headers=headers)
+def get_firebase_data(token, path):
+    """Obtener datos de Firebase usando token como parámetro"""
+    url = f"https://{PROJECT_ID}-default-rtdb.firebaseio.com/{path}.json?access_token={token}"
+    resp = requests.get(url)
     if resp.status_code != 200:
-        print(f"Error obteniendo tokens: {resp.text}")
-        return []
-    data = resp.json()
-    if not data:
-        return []
-    tokens = []
-    for uid, info in data.items():
-        if isinstance(info, dict) and 'token' in info:
-            tokens.append(info['token'])
-    return tokens
+        print(f"Error obteniendo {path}: {resp.text}")
+        return None
+    return resp.json()
 
-def get_partidos_firebase(token_acceso):
-    """Obtener todos los partidos"""
-    url = f"https://{PROJECT_ID}-default-rtdb.firebaseio.com/partidos.json"
-    headers = {"Authorization": f"Bearer {token_acceso}"}
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        print(f"Error obteniendo partidos: {resp.text}")
-        return {}
-    return resp.json() or {}
-
-def enviar_notificacion(token_acceso, device_token, titulo, cuerpo):
-    """Enviar notificación a un dispositivo"""
+def enviar_notificacion(token, device_token, titulo, cuerpo):
     url = f"https://fcm.googleapis.com/v1/projects/{PROJECT_ID}/messages:send"
     headers = {
-        "Authorization": f"Bearer {token_acceso}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     payload = {
         "message": {
             "token": device_token,
-            "notification": {
-                "title": titulo,
-                "body": cuerpo
-            },
+            "notification": {"title": titulo, "body": cuerpo},
             "webpush": {
                 "notification": {
                     "title": titulo,
                     "body": cuerpo,
                     "icon": "/icon-192.png",
-                    "badge": "/icon-192.png",
                     "vibrate": [200, 100, 200]
                 },
                 "fcm_options": {
@@ -83,76 +61,72 @@ def enviar_notificacion(token_acceso, device_token, titulo, cuerpo):
     return resp.status_code == 200
 
 def main():
-    print(f"🕐 Revisando partidos — {datetime.now(COL_TZ).strftime('%Y-%m-%d %H:%M')} Colombia")
+    ahora = datetime.now(COL_TZ)
+    print(f"🕐 Revisando partidos — {ahora.strftime('%Y-%m-%d %H:%M')} Colombia")
 
-    # Obtener token de acceso
-    token_acceso = get_access_token()
+    token = get_access_token()
+    print("✅ Token de acceso obtenido")
 
-    # Obtener partidos y tokens
-    partidos = get_partidos_firebase(token_acceso)
-    tokens   = get_tokens_firebase(token_acceso)
+    # Obtener partidos
+    partidos = get_firebase_data(token, 'partidos')
+    if not partidos:
+        print("⚠️ No se pudieron obtener los partidos")
+        return
+    print(f"✅ Partidos encontrados: {len(partidos)}")
 
-    if not tokens:
+    # Obtener tokens de dispositivos
+    tokens_data = get_firebase_data(token, 'tokens')
+    device_tokens = []
+    if tokens_data:
+        for uid, info in tokens_data.items():
+            if isinstance(info, dict) and 'token' in info:
+                device_tokens.append(info['token'])
+    print(f"📱 Dispositivos registrados: {len(device_tokens)}")
+
+    if not device_tokens:
         print("⚠️ No hay dispositivos registrados para notificaciones")
+        print("   Los participantes deben aceptar notificaciones en la app")
         return
 
-    print(f"📱 Dispositivos registrados: {len(tokens)}")
-
-    # Hora actual en Colombia
-    ahora = datetime.now(COL_TZ)
-
-    notificaciones_enviadas = 0
+    ET_TZ = timezone(timedelta(hours=-4))
+    notif_enviadas = 0
 
     for pid, p in partidos.items():
-        # Solo partidos no finalizados
         if p.get('estado') in ['Finalizado', 'Resultado confirmado']:
             continue
-
-        # Construir datetime del cierre en ET y convertir a Colombia
         try:
             cierre_str = p.get('cierre', '')
             if not cierre_str:
                 continue
 
-            # Cierre está en ET (UTC-4 en verano)
-            ET_TZ = timezone(timedelta(hours=-4))
             cierre_et = datetime.strptime(cierre_str, '%Y-%m-%d %H:%M')
             cierre_et = cierre_et.replace(tzinfo=ET_TZ)
-
-            # Convertir a Colombia
             cierre_col = cierre_et.astimezone(COL_TZ)
+            diff = (cierre_col - ahora).total_seconds() / 60
 
-            # ¿El cierre es en los próximos 10-15 minutos?
-            diff = (cierre_col - ahora).total_seconds() / 60  # diferencia en minutos
+            print(f"   {p.get('local')} vs {p.get('visita')}: cierra en {diff:.1f} min")
 
-            if 9 <= diff <= 15:  # ventana de 9 a 15 minutos antes del cierre
-                local   = p.get('local', '')
-                visita  = p.get('visita', '')
-                grupo   = p.get('grupo', '')
-                hora_col = cierre_col.strftime('%I:%M %p')
+            if 8 <= diff <= 15:
+                local  = p.get('local', '')
+                visita = p.get('visita', '')
+                grupo  = p.get('grupo', '')
+                hora   = cierre_col.strftime('%I:%M %p')
 
                 titulo = f"⚽ ¡Cierra en {int(diff)} min!"
-                cuerpo = f"{local} vs {visita} — Grupo {grupo}\n🔒 Apuestas cierran a las {hora_col} (Col)\n¡Entra y apuesta YA!"
+                cuerpo = f"{local} vs {visita} — Grupo {grupo}\n🔒 Apuestas cierran a las {hora}\n¡Entra y apuesta YA!"
 
-                print(f"\n🔔 Enviando notificación: {local} vs {visita}")
-                print(f"   Cierra en: {diff:.1f} minutos")
-
-                enviados = 0
-                for token in tokens:
-                    if enviar_notificacion(token_acceso, token, titulo, cuerpo):
-                        enviados += 1
-
-                print(f"   ✅ Enviada a {enviados}/{len(tokens)} dispositivos")
-                notificaciones_enviadas += 1
+                print(f"\n🔔 Enviando: {local} vs {visita}")
+                enviados = sum(1 for t in device_tokens if enviar_notificacion(token, t, titulo, cuerpo))
+                print(f"   ✅ Enviada a {enviados}/{len(device_tokens)} dispositivos")
+                notif_enviadas += 1
 
         except Exception as e:
-            print(f"Error procesando partido {pid}: {e}")
-            continue
+            print(f"Error en partido {pid}: {e}")
 
-    if notificaciones_enviadas == 0:
-        print("\n✅ No hay partidos próximos a cerrar en este momento")
+    if notif_enviadas == 0:
+        print("\n✅ No hay partidos cerrando en los próximos 8-15 minutos")
     else:
-        print(f"\n✅ {notificaciones_enviadas} notificaciones enviadas")
+        print(f"\n🏆 {notif_enviadas} notificaciones enviadas")
 
 if __name__ == '__main__':
     main()
